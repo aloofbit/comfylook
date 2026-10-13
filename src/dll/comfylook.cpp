@@ -231,17 +231,78 @@ namespace
     //
     // When mouselook ends, the client puts the cursor back where the drag started. Synergy moved its own
     // cursor during the drag and does not see that, so its next move puts the cursor where its own cursor
-    // is. A low-level mouse hook moves each later Synergy move by the difference, so the cursor stays
-    // where the drag started. When the moved cursor meets a screen edge, the difference gets smaller, so
-    // pushing the cursor against an edge brings the two cursors together again.
+    // is. A low-level mouse hook maps each later Synergy move to a cursor position, so the cursor stays
+    // where the drag started.
+    //
+    // The map has two straight parts on each axis. Synergy's position at the end of the drag gives the
+    // drag start, and each screen edge gives the same edge. So Synergy reaches its edge when the cursor
+    // reaches the screen edge: each part of the screen stays in reach, and Synergy changes screen at the
+    // visible edge. When Synergy reaches an edge, the two positions are the same and the map on that axis
+    // ends. A fixed offset in place of the map made part of the screen unreachable, and each drag added
+    // to the offset.
     //
     // The hook starts only after the first absolute raw event, so a normal mouse never has it.
 
     HMODULE g_module = nullptr;
-    std::atomic<long> g_offX{ 0 }, g_offY{ 0 };       // added to each Synergy move
     std::atomic<long> g_senderX{ 0 }, g_senderY{ 0 }; // the newest position from the sender
     std::atomic<bool> g_haveSender{ false };
     std::atomic<bool> g_absFresh{ false };            // the hook dropped moves: no distance to the next one
+
+    // A part of the map moves the cursor at most this many pixels for each Synergy pixel, and at least
+    // the inverse. A larger change in speed is easy to feel. Past that, the cursor goes to Synergy's
+    // position. A short drag moves Synergy a short way, so the cursor stays at the drag start.
+    const double kMaxSlope = 1.25;
+
+    struct Axis
+    {
+        std::atomic<bool> on{ false };
+        std::atomic<long> sender{ 0 };   // Synergy's position at the end of the drag
+        std::atomic<long> cursor{ 0 };   // the drag start
+    };
+    Axis g_mapX, g_mapY;
+
+    void ScreenBounds(long& l, long& t, long& r, long& b)
+    {
+        l = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        t = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        r = l + GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1;
+        b = t + GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1;
+    }
+
+    // False if a part is too steep or too flat. Synergy against an edge gives a part of no width.
+    bool AxisFits(long sender, long cursor, long lo, long hi)
+    {
+        if (sender == cursor)
+            return true;
+        if (sender <= lo || sender >= hi || cursor <= lo || cursor >= hi)
+            return false;
+        const double low = static_cast<double>(cursor - lo) / (sender - lo);
+        const double high = static_cast<double>(hi - cursor) / (hi - sender);
+        return low <= kMaxSlope && low >= 1 / kMaxSlope && high <= kMaxSlope && high >= 1 / kMaxSlope;
+    }
+
+    void SetAxis(Axis& axis, long sender, long cursor)
+    {
+        axis.on = false;
+        axis.sender = sender;
+        axis.cursor = cursor;
+        axis.on = sender != cursor;
+    }
+
+    long MapAxis(Axis& axis, long p, long lo, long hi)
+    {
+        if (!axis.on)
+            return p;
+        if (p <= lo || p >= hi)
+        {
+            axis.on = false;
+            return p;
+        }
+        const long s = axis.sender, c = axis.cursor;
+        if (p <= s)
+            return lo + std::lround(static_cast<double>(p - lo) * (c - lo) / (s - lo));
+        return c + std::lround(static_cast<double>(p - s) * (hi - c) / (hi - s));
+    }
 
     LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp)
     {
@@ -253,26 +314,20 @@ namespace
                 g_senderX = h->pt.x;
                 g_senderY = h->pt.y;
                 g_haveSender = true;
-                long ox = g_offX, oy = g_offY;
-                if (ox || oy)
+                if (g_mapX.on || g_mapY.on)
                 {
                     if (!g_window || GetForegroundWindow() != g_window)
                     {
                         // Out of the game, the cursor goes where Synergy puts it.
-                        g_offX = 0;
-                        g_offY = 0;
+                        g_mapX.on = false;
+                        g_mapY.on = false;
                     }
                     else if (!MouseLookOn())
                     {
-                        const long l = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                        const long t = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                        const long r = l + GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1;
-                        const long b = t + GetSystemMetrics(SM_CYVIRTUALSCREEN) - 1;
-                        long x = h->pt.x + ox, y = h->pt.y + oy;
-                        x = x < l ? l : x > r ? r : x;
-                        y = y < t ? t : y > b ? b : y;
-                        g_offX = x - h->pt.x;
-                        g_offY = y - h->pt.y;
+                        long l, t, r, b;
+                        ScreenBounds(l, t, r, b);
+                        const long x = MapAxis(g_mapX, h->pt.x, l, r);
+                        const long y = MapAxis(g_mapY, h->pt.y, t, b);
                         g_absFresh = true;
                         SetCursorPos(x, y);
                         return 1;
@@ -320,18 +375,27 @@ namespace
     void DragEnd(HWND hwnd)
     {
         const Drag& d = g_drag;
-        Log("drag %lu ms: %ld raw events (%ld absolute), raw %lld x %lld; %ld cursor moves, cursor %lld x %lld; "
-            "mouseSpeed scale %.1f",
-            GetTickCount() - d.start, d.events, d.absolute, d.rawX, d.rawY, d.moves, d.curX, d.curY, Scale());
         g_drag.on = false;
 
         // The client has put the cursor back where the drag started. Keep it there.
+        char held[160] = "";
         POINT centre = { At<LONG>(kCentre), At<LONG>(kCentre + 4) };
         if (d.absolute > 0 && g_haveSender && ClientToScreen(hwnd, &centre))
         {
-            g_offX = centre.x - g_senderX;
-            g_offY = centre.y - g_senderY;
+            const long sx = g_senderX, sy = g_senderY;
+            long l, t, r, b;
+            ScreenBounds(l, t, r, b);
+            // Both axes or neither: a cursor that jumps on one axis is not at the drag start either.
+            const bool hold = AxisFits(sx, centre.x, l, r) && AxisFits(sy, centre.y, t, b);
+            SetAxis(g_mapX, sx, hold ? centre.x : sx);
+            SetAxis(g_mapY, sy, hold ? centre.y : sy);
+            sprintf_s(held, "; Synergy at %ld,%ld, drag start %ld,%ld, offset %ld,%ld, cursor %s",
+                sx, sy, centre.x, centre.y, centre.x - sx, centre.y - sy,
+                hold ? "held" : "follows Synergy");
         }
+        Log("drag %lu ms: %ld raw events (%ld absolute), raw %lld x %lld; %ld cursor moves, cursor %lld x %lld; "
+            "mouseSpeed scale %.1f%s",
+            GetTickCount() - d.start, d.events, d.absolute, d.rawX, d.rawY, d.moves, d.curX, d.curY, Scale(), held);
     }
 
     void Register(HWND hwnd)
@@ -505,7 +569,7 @@ namespace
         FILE* f = nullptr;
         if (_wfopen_s(&f, g_logPath, L"w") == 0 && f)
             fclose(f);
-        Log("comfylook.dll 0.1.0-alpha loaded");
+        Log("comfylook.dll 0.1.1-alpha loaded");
 
         if (!ClientMatches())
         {
